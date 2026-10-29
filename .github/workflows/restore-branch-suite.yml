@@ -434,23 +434,26 @@ jobs:
                   try:
                       rec, _ = restore_node(verify, root, node)
                       token = "BRANCH_OK_" + node
-                      program = "try { print('%s'); } catch (e) { print('BRANCH_ERR ' + e); }\nwhile (true) {}\n" % token
+                      program = (
+                          "try { console.log('%s'); } catch (e) { console.log('BRANCH_ERR ' + e); }\n"
+                          "while (true) {}\n"
+                      ) % token
                       host = WORKDIR / "branch.js"
                       host.write_text(program)
                       stop_children()
                       run(["docker", "cp", str(host), "egym-target:/tmp/v8/turn.js"])
                       run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' 1 > /tmp/v8/go"])
                       seen = ""
+                      alive = False
                       for _ in range(40):
                           proc = subprocess.run(["docker", "exec", "egym-target", "cat", "/tmp/v8/out"], capture_output=True)
                           seen = (proc.stdout or b"").decode(errors="replace")
-                          if token in seen:
+                          alive = process_census()["d8"] == 1
+                          if any(line.strip() == token for line in seen.splitlines()) and alive:
                               break
                           time.sleep(0.25)
-                      if token not in seen:
-                          raise RuntimeError("branch output missing: " + seen[:300])
-                      if process_census()["d8"] != 1:
-                          raise RuntimeError("d8 was not alive at the branch checkpoint")
+                      if not any(line.strip() == token for line in seen.splitlines()) or not alive:
+                          raise RuntimeError("branch did not stay up: alive=%s out=%s" % (alive, seen[:300]))
                       live = checkpoint_live("b" + node)
                       upper_dir = live.parent / ("upper-" + node)
                       save_upper(upper_dir)
@@ -466,7 +469,7 @@ jobs:
                           and back["turn"] == rec["turn"]
                           and back["counter"] == rec["counter"]
                           and census["d8"] == 1
-                          and token in out
+                          and any(line.strip() == token for line in out.splitlines())
                       )
                       record(name, ok, "turn=%s counter=%s d8=%s out=%s" % (back["turn"], back["counter"], census["d8"], token in out))
                       if not ok:
