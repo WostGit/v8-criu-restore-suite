@@ -1,0 +1,466 @@
+name: "V8 CRIU restore and branch suite"
+# Restores trajectory-40725905785 on the real V8 image.
+# Every node is restored into a new container, node 000 is restored twice,
+# node 000 is replaced by node 009, node 004 is checkpointed again, and
+# four nodes run a fixed program after the restore.
+# An empty repository needs only this file. No API key.
+
+"on":
+  workflow_dispatch:
+
+env:
+  V8_IMAGE: "cybergym/v8:human-446124892-nosandbox-buildable"
+  IMAGE_DIGEST: "sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a"
+  RELEASE_URL: "https://github.com/WostGit/v8-criu-trajectory/releases/download/trajectory-40725905785/trajectory-40725905785.tar.gz"
+  RELEASE_SHA256: "43881e8f3eeb23845018d0288274efd374ea0b713e8605e2531cfb0ccdf6c39b"
+  EXPECT_KERNEL: "7.0.0-1017-azure"
+  EXPECT_DOCKER: "29.9.2"
+  EXPECT_NONCE: "4ae904ac657fba2d"
+  DOCKER_APT_VERSION: "5:29.9.2-1~ubuntu.24.04~noble"
+  DOCKER_VERSION: "29.9.2"
+  CRIU_COMMIT: "2b7ac603cda31d015d91c856c34c557cb2300e7d"
+  WORKDIR: ${{ github.workspace }}/work
+  SUITE_ROOT: ${{ github.workspace }}/work/suite
+
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Download the release and audit it
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORKDIR}/suite"
+          python3 - << 'PY'
+          import hashlib, os, tarfile, urllib.request
+          from pathlib import Path
+          url = os.environ["RELEASE_URL"]
+          want = os.environ["RELEASE_SHA256"]
+          dest = Path(os.environ["WORKDIR"]) / "release.tar.gz"
+          urllib.request.urlretrieve(url, dest)
+          got = hashlib.sha256(dest.read_bytes()).hexdigest()
+          if got != want:
+              raise SystemExit("sha256 %s != %s" % (got, want))
+          root = Path(os.environ["WORKDIR"]) / "release"
+          root.mkdir(parents=True)
+          with tarfile.open(dest) as tar:
+              tar.extractall(root)
+          print("archive ok", got)
+          PY
+          python3 "${WORKDIR}/release/verify.py" "${WORKDIR}/release"
+      - name: Install Docker 29.9.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y ca-certificates curl gnupg
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades \
+            docker-ce=${{ env.DOCKER_APT_VERSION }} \
+            docker-ce-cli=${{ env.DOCKER_APT_VERSION }} \
+            containerd.io
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          got=$(docker version --format '{{.Server.Version}}')
+          echo "docker $got"
+          test "$got" = "${{ env.DOCKER_VERSION }}"
+          sudo sysctl -w kernel.randomize_va_space=0 || true
+          echo "kernel $(uname -r)"
+      - name: Build CRIU 4.3
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y build-essential pkg-config git \
+            libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+            python3-protobuf libnl-3-dev libcap-dev uuid-dev libnet1-dev \
+            libaio-dev python3-yaml libgnutls28-dev
+          git clone https://github.com/checkpoint-restore/criu.git
+          cd criu
+          git checkout ${{ env.CRIU_COMMIT }}
+          make -j"$(nproc)"
+          sudo make install-criu
+          sudo ldconfig
+          sudo ln -sfn /usr/local/sbin/criu /usr/local/bin/criu
+          sudo ln -sfn /usr/local/sbin/criu /usr/bin/criu
+          sudo ln -sfn /usr/local/sbin/criu /usr/sbin/criu
+          criu --version
+      - name: Pull the recorded V8 image
+        run: |
+          set -euo pipefail
+          docker pull "${{ env.V8_IMAGE }}"
+          got=$(docker image inspect "${{ env.V8_IMAGE }}" --format '{{index .RepoDigests 0}}')
+          echo "$got"
+          case "$got" in
+            *"${{ env.IMAGE_DIGEST }}" ) ;;
+            * ) echo "digest mismatch: $got"; exit 1 ;;
+          esac
+      - name: Restore every node and branch
+        env:
+          RELEASE_URL: ${{ env.RELEASE_URL }}
+          RELEASE_SHA256: ${{ env.RELEASE_SHA256 }}
+          V8_IMAGE: ${{ env.V8_IMAGE }}
+          IMAGE_DIGEST: ${{ env.IMAGE_DIGEST }}
+          EXPECT_KERNEL: ${{ env.EXPECT_KERNEL }}
+          EXPECT_DOCKER: ${{ env.EXPECT_DOCKER }}
+          EXPECT_NONCE: ${{ env.EXPECT_NONCE }}
+          WORKDIR: ${{ env.WORKDIR }}
+          SUITE_ROOT: ${{ env.SUITE_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          #!/usr/bin/env python3
+          """Restore every node of a recorded V8 trajectory, then branch from several."""
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import shutil
+          import subprocess
+          import tarfile
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          RELEASE_URL = os.environ["RELEASE_URL"]
+          RELEASE_SHA = os.environ["RELEASE_SHA256"]
+          IMAGE = os.environ["V8_IMAGE"]
+          WORKDIR = Path(os.environ["WORKDIR"])
+          SUITE = Path(os.environ["SUITE_ROOT"])
+          EXPECT_KERNEL = os.environ["EXPECT_KERNEL"]
+          EXPECT_DOCKER = os.environ["EXPECT_DOCKER"]
+          EXPECT_NONCE = os.environ["EXPECT_NONCE"]
+
+          WORKDIR.mkdir(parents=True, exist_ok=True)
+          SUITE.mkdir(parents=True, exist_ok=True)
+          results = []
+
+
+          def log(msg):
+              line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+              print(line, flush=True)
+              with open(SUITE / "suite.log", "a") as fh:
+                  fh.write(line + "\n")
+
+
+          def run(cmd, check=True):
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              if check and proc.returncode != 0:
+                  raise RuntimeError("$ " + " ".join(cmd) + "\n" + (proc.stdout or "") + (proc.stderr or ""))
+              return proc
+
+
+          def record(name, ok, detail):
+              row = {"test": name, "ok": bool(ok), "detail": detail}
+              results.append(row)
+              log(("PASS " if ok else "FAIL ") + name + " " + str(detail)[:500])
+              (SUITE / "SUITE.json").write_text(json.dumps(results, indent=2))
+
+
+          def download():
+              dest = WORKDIR / "release.tar.gz"
+              urllib.request.urlretrieve(RELEASE_URL, dest)
+              digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+              if digest != RELEASE_SHA:
+                  raise RuntimeError("archive sha256 %s != %s" % (digest, RELEASE_SHA))
+              root = WORKDIR / "release"
+              if root.exists():
+                  shutil.rmtree(root)
+              root.mkdir()
+              with tarfile.open(dest) as tar:
+                  tar.extractall(root)
+              return root
+
+
+          def load_verify(root):
+              spec = importlib.util.spec_from_file_location("verify", root / "verify.py")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+
+          def ensure_netns():
+              state = run(["docker", "inspect", "-f", "{{.State.Running}}", "net-keeper"], check=False)
+              if (state.stdout or "").strip() == "true":
+                  return
+              run(["docker", "rm", "-f", "net-keeper"], check=False)
+              base = [
+                  "docker", "run", "-d", "--name", "net-keeper", "--runtime", "runc",
+                  "--network", "none", "--security-opt", "seccomp=unconfined",
+                  "--security-opt", "apparmor=unconfined",
+              ]
+              proc = run(base + ["--entrypoint", "/bin/sleep", IMAGE, "infinity"], check=False)
+              if proc.returncode != 0:
+                  run(["docker", "rm", "-f", "net-keeper"], check=False)
+                  run(base + ["--entrypoint", "/bin/bash", IMAGE, "-c", "sleep infinity"])
+
+
+          def create_container():
+              ensure_netns()
+              run(["docker", "rm", "-f", "egym-target"], check=False)
+              run([
+                  "docker", "create", "--name", "egym-target", "--runtime", "runc",
+                  "--network", "container:net-keeper",
+                  "--security-opt", "seccomp=unconfined",
+                  "--security-opt", "apparmor=unconfined",
+                  "--entrypoint", "/opt/keeper", IMAGE,
+              ])
+
+
+          def apply_upper(node_dir):
+              upper = run(["docker", "inspect", "-f", "{{.GraphDriver.Data.UpperDir}}", "egym-target"]).stdout.strip()
+              run(["sudo", "tar", "-C", upper, "-xzf", str(node_dir / "upper.tar.gz")])
+
+
+          def restore_name(name, src):
+              ckpt_root = WORKDIR / "ckpts"
+              if ckpt_root.exists():
+                  shutil.rmtree(ckpt_root)
+              dest_src = ckpt_root / name
+              dest_src.parent.mkdir(parents=True, exist_ok=True)
+              run(["sudo", "cp", "-a", str(src), str(dest_src)])
+              run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dest_src)])
+              cid = run(["docker", "inspect", "-f", "{{.Id}}", "egym-target"]).stdout.strip()
+              parent = Path("/var/lib/docker/containers") / cid / "checkpoints"
+              dest = parent / name
+              run(["sudo", "mkdir", "-p", str(parent)])
+              run(["sudo", "rm", "-rf", str(dest)])
+              run(["sudo", "cp", "-a", str(dest_src), str(dest)])
+              running = run(["docker", "inspect", "-f", "{{.State.Running}}", "egym-target"]).stdout.strip()
+              if running == "true":
+                  run(["docker", "stop", "-t", "5", "egym-target"])
+              last = ""
+              for attempt in range(1, 4):
+                  proc = run(["docker", "start", "--checkpoint", name, "egym-target"], check=False)
+                  time.sleep(0.6)
+                  state = run(["docker", "inspect", "-f", "{{.State.Running}}", "egym-target"], check=False)
+                  if proc.returncode == 0 and (state.stdout or "").strip() == "true":
+                      return
+                  last = (proc.stdout or "") + (proc.stderr or "")
+                  log(f"restore {name} attempt {attempt} failed: {last[-800:]}")
+                  time.sleep(1)
+              raise RuntimeError("restore failed: " + last[-2000:])
+
+
+          def read_marker(verify):
+              run(["docker", "kill", "--signal=SIGUSR1", "egym-target"])
+              time.sleep(0.4)
+              proc = subprocess.run(["docker", "exec", "egym-target", "cat", "/tmp/probe_state"], capture_output=True)
+              if proc.returncode != 0 or len(proc.stdout) < 32:
+                  raise RuntimeError("no probe_state: " + (proc.stderr or b"").decode(errors="replace")[:400])
+              found = verify.parse_marker(proc.stdout[:32])
+              if not found:
+                  raise RuntimeError("probe_state has no marker: " + proc.stdout[:32].hex())
+              return found[0]
+
+
+          def process_census():
+              pid = run(["docker", "inspect", "-f", "{{.State.Pid}}", "egym-target"]).stdout.strip()
+              script = (
+                  "for d in /proc/[0-9]*; do "
+                  "c=$(cat \"$d/comm\" 2>/dev/null || true); "
+                  "printf '%s %s\\n' \"${d#/proc/}\" \"$c\"; "
+                  "done"
+              )
+              proc = run(["sudo", "nsenter", "-t", pid, "-p", "-m", "sh", "-c", script])
+              rows = []
+              for line in (proc.stdout or "").splitlines():
+                  parts = line.split(" ", 1)
+                  if len(parts) == 2 and parts[0].isdigit():
+                      rows.append((int(parts[0]), parts[1].strip()))
+              d8 = [item for item in rows if item[1] == "d8"]
+              keeper = [item for item in rows if item[0] == 1]
+              return {"count": len(rows), "d8": len(d8), "pid1": keeper[0][1] if keeper else ""}
+
+
+          def restore_node(verify, root, node):
+              node_dir = root / "nodes" / node
+              result = json.loads((node_dir / "result.json").read_text())
+              create_container()
+              apply_upper(node_dir)
+              restore_name("n" + node, node_dir / "docker-ckpt")
+              rec = read_marker(verify)
+              census = process_census()
+              if rec["nonce"] != result["nonce"] or rec["turn"] != result["turn"] or rec["counter"] != result["counter"]:
+                  raise RuntimeError("marker got %s want nonce=%s turn=%s counter=%s" % (
+                      rec, result["nonce"], result["turn"], result["counter"]))
+              if census["d8"] != 1 or census["pid1"] != "keeper":
+                  raise RuntimeError("process shape %s" % census)
+              return rec, census
+
+
+          def checkpoint_live(name):
+              root = WORKDIR / "ckpts"
+              root.mkdir(parents=True, exist_ok=True)
+              dest = root / name
+              if dest.exists():
+                  shutil.rmtree(dest)
+              run(["docker", "checkpoint", "create", "--checkpoint-dir", str(root), "egym-target", name])
+              run(["sudo", "chmod", "-R", "a+rX", str(dest)])
+              return dest
+
+
+          def main():
+              root = download()
+              verify = load_verify(root)
+              try:
+                  errors = verify.check_tree(root)
+              except Exception as exc:
+                  record("audit", False, str(exc))
+                  raise SystemExit(1)
+              record("audit", not errors, "ok" if not errors else "\n".join(errors))
+              if errors:
+                  raise SystemExit(1)
+
+              manifest = json.loads((root / "MANIFEST.json").read_text())
+              nonces = {json.loads((root / "nodes" / f"{i:03d}" / "result.json").read_text())["nonce"] for i in range(10)}
+              pages = [json.loads((root / "nodes" / f"{i:03d}" / "result.json").read_text())["pages_sha256"] for i in range(10)]
+              identity_ok = (
+                  manifest.get("image_digest") == os.environ["IMAGE_DIGEST"]
+                  and nonces == {EXPECT_NONCE}
+                  and len(set(pages)) == 10
+                  and manifest.get("solve_claimed") is False
+              )
+              record("archive_identity", identity_ok, "nonce=%s distinct_pages=%s" % (sorted(nonces), len(set(pages))))
+              if not identity_ok:
+                  raise SystemExit(1)
+
+              kernel = os.uname().release
+              if kernel != EXPECT_KERNEL:
+                  record("kernel", False, "need %s have %s" % (EXPECT_KERNEL, kernel))
+                  raise SystemExit(1)
+              record("kernel", True, kernel)
+
+              for i in range(10):
+                  node = f"{i:03d}"
+                  try:
+                      rec, census = restore_node(verify, root, node)
+                      record("restore-" + node, True, "turn=%s counter=%s d8=%s procs=%s" % (
+                          rec["turn"], rec["counter"], census["d8"], census["count"]))
+                  except Exception as exc:
+                      record("restore-" + node, False, str(exc)[-800:])
+                      raise SystemExit(1)
+
+              try:
+                  rec, census = restore_node(verify, root, "000")
+                  record("restore-000-again", rec["turn"] == 0 and rec["counter"] == 1 and census["d8"] == 1,
+                         "turn=%s counter=%s d8=%s" % (rec["turn"], rec["counter"], census["d8"]))
+              except Exception as exc:
+                  record("restore-000-again", False, str(exc)[-800:])
+                  raise SystemExit(1)
+
+              try:
+                  first, _ = restore_node(verify, root, "000")
+                  second, census = restore_node(verify, root, "009")
+                  ok = first["nonce"] == second["nonce"] == EXPECT_NONCE and first["turn"] == 0 and second["turn"] == 9 and census["d8"] == 1
+                  record("swap-000-to-009", ok, "turns %s then %s nonce %s" % (first["turn"], second["turn"], second["nonce"]))
+                  if not ok:
+                      raise SystemExit(1)
+              except SystemExit:
+                  raise
+              except Exception as exc:
+                  record("swap-000-to-009", False, str(exc)[-800:])
+                  raise SystemExit(1)
+
+              try:
+                  rec, _ = restore_node(verify, root, "004")
+                  checkpoint_live("regen004")
+                  run(["docker", "stop", "-t", "5", "egym-target"])
+                  restore_name("regen004", WORKDIR / "ckpts" / "regen004")
+                  again = read_marker(verify)
+                  census = process_census()
+                  ok = again == {"magic": rec["magic"], "counter": rec["counter"], "turn": rec["turn"], "nonce": rec["nonce"]} or (
+                      again["nonce"] == rec["nonce"] and again["turn"] == rec["turn"] and again["counter"] == rec["counter"]
+                  )
+                  ok = ok and census["d8"] == 1
+                  record("regen-004", ok, "counter=%s d8=%s" % (again["counter"], census["d8"]))
+                  if not ok:
+                      raise SystemExit(1)
+              except SystemExit:
+                  raise
+              except Exception as exc:
+                  record("regen-004", False, str(exc)[-800:])
+                  raise SystemExit(1)
+
+              for node in ("000", "003", "007", "009"):
+                  name = "branch-" + node
+                  try:
+                      rec, _ = restore_node(verify, root, node)
+                      token = "BRANCH_OK_" + node
+                      program = "try { print('%s'); } catch (e) { print('BRANCH_ERR ' + e); }\nwhile (true) {}\n" % token
+                      host = WORKDIR / "branch.js"
+                      host.write_text(program)
+                      run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' 1 > /tmp/v8/kill"])
+                      gone = False
+                      for _ in range(50):
+                          if process_census()["d8"] == 0:
+                              gone = True
+                              break
+                          time.sleep(0.2)
+                      if not gone:
+                          raise RuntimeError("old d8 did not exit")
+                      run(["docker", "cp", str(host), "egym-target:/tmp/v8/turn.js"])
+                      run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' 1 > /tmp/v8/go"])
+                      seen = ""
+                      for _ in range(40):
+                          proc = subprocess.run(["docker", "exec", "egym-target", "cat", "/tmp/v8/out"], capture_output=True)
+                          seen = (proc.stdout or b"").decode(errors="replace")
+                          if token in seen:
+                              break
+                          time.sleep(0.25)
+                      if token not in seen:
+                          raise RuntimeError("branch output missing: " + seen[:300])
+                      checkpoint_live("b" + node)
+                      run(["docker", "stop", "-t", "5", "egym-target"])
+                      restore_name("b" + node, WORKDIR / "ckpts" / ("b" + node))
+                      back = read_marker(verify)
+                      census = process_census()
+                      proc = subprocess.run(["docker", "exec", "egym-target", "cat", "/tmp/v8/out"], capture_output=True)
+                      out = (proc.stdout or b"").decode(errors="replace")
+                      ok = (
+                          back["nonce"] == rec["nonce"] == EXPECT_NONCE
+                          and back["turn"] == rec["turn"]
+                          and back["counter"] == rec["counter"]
+                          and census["d8"] == 1
+                          and token in out
+                      )
+                      record(name, ok, "turn=%s counter=%s d8=%s out=%s" % (back["turn"], back["counter"], census["d8"], token in out))
+                      if not ok:
+                          raise SystemExit(1)
+                  except SystemExit:
+                      raise
+                  except Exception as exc:
+                      record(name, False, str(exc)[-800:])
+                      raise SystemExit(1)
+
+              record("suite", True, "%s tests" % len(results))
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except SystemExit:
+                  (SUITE / "SUITE.json").write_text(json.dumps(results, indent=2))
+                  raise
+              except Exception as exc:
+                  record("suite", False, str(exc)[-800])
+                  raise SystemExit(1)
+          PY
+      - name: Upload suite result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-suite-${{ github.run_id }}
+          path: ${{ env.SUITE_ROOT }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show the suite result
+        if: always()
+        run: |
+          echo "===== SUITE ====="
+          cat "${{ env.SUITE_ROOT }}/SUITE.json" 2>/dev/null || true
