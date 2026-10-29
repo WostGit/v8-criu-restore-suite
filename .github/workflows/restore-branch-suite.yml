@@ -262,13 +262,15 @@ jobs:
 
           def process_census():
               pid = run(["docker", "inspect", "-f", "{{.State.Pid}}", "egym-target"]).stdout.strip()
+              # Mount namespace only. Entering the pid namespace would make this
+              # shell a container pid greater than 1, and the keeper kills those.
               script = (
                   "for d in /proc/[0-9]*; do "
                   "c=$(cat \"$d/comm\" 2>/dev/null || true); "
                   "printf '%s %s\\n' \"${d#/proc/}\" \"$c\"; "
                   "done"
               )
-              proc = run(["sudo", "nsenter", "-t", pid, "-p", "-m", "sh", "-c", script])
+              proc = run(["sudo", "nsenter", "-t", pid, "-m", "--", "sh", "-c", script])
               rows = []
               for line in (proc.stdout or "").splitlines():
                   parts = line.split(" ", 1)
