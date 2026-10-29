@@ -376,10 +376,12 @@ jobs:
                   restore_name("regen004", WORKDIR / "ckpts" / "regen004")
                   again = read_marker(verify)
                   census = process_census()
-                  ok = again == {"magic": rec["magic"], "counter": rec["counter"], "turn": rec["turn"], "nonce": rec["nonce"]} or (
-                      again["nonce"] == rec["nonce"] and again["turn"] == rec["turn"] and again["counter"] == rec["counter"]
+                  ok = (
+                      again["nonce"] == rec["nonce"] == EXPECT_NONCE
+                      and again["turn"] == rec["turn"]
+                      and again["counter"] == rec["counter"]
+                      and census["d8"] == 1
                   )
-                  ok = ok and census["d8"] == 1
                   record("regen-004", ok, "counter=%s d8=%s" % (again["counter"], census["d8"]))
                   if not ok:
                       raise SystemExit(1)
