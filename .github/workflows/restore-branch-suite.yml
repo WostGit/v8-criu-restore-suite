@@ -217,19 +217,21 @@ jobs:
 
 
           def restore_name(name, src):
-              ckpt_root = WORKDIR / "ckpts"
-              if ckpt_root.exists():
-                  shutil.rmtree(ckpt_root)
-              dest_src = ckpt_root / name
-              dest_src.parent.mkdir(parents=True, exist_ok=True)
-              run(["sudo", "cp", "-a", str(src), str(dest_src)])
-              run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dest_src)])
+              src = Path(src).resolve()
+              staging_root = WORKDIR / "ckpt-staging"
+              staged = staging_root / name
+              # Copy first. The source can sit inside a root-owned checkpoint
+              # directory, so it must not be deleted before this copy.
+              run(["sudo", "rm", "-rf", str(staging_root)])
+              staging_root.mkdir(parents=True, exist_ok=True)
+              run(["sudo", "cp", "-a", str(src), str(staged)])
+              run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(staged)])
               cid = run(["docker", "inspect", "-f", "{{.Id}}", "egym-target"]).stdout.strip()
               parent = Path("/var/lib/docker/containers") / cid / "checkpoints"
               dest = parent / name
               run(["sudo", "mkdir", "-p", str(parent)])
               run(["sudo", "rm", "-rf", str(dest)])
-              run(["sudo", "cp", "-a", str(dest_src), str(dest)])
+              run(["sudo", "cp", "-a", str(staged), str(dest)])
               running = run(["docker", "inspect", "-f", "{{.State.Running}}", "egym-target"]).stdout.strip()
               if running == "true":
                   run(["docker", "stop", "-t", "5", "egym-target"])
@@ -298,9 +300,10 @@ jobs:
               root.mkdir(parents=True, exist_ok=True)
               dest = root / name
               if dest.exists():
-                  shutil.rmtree(dest)
+                  run(["sudo", "rm", "-rf", str(dest)])
               run(["docker", "checkpoint", "create", "--checkpoint-dir", str(root), "egym-target", name])
               run(["sudo", "chmod", "-R", "a+rX", str(dest)])
+              run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(dest)])
               return dest
 
 
