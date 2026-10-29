@@ -272,7 +272,7 @@ jobs:
               return found[0]
 
 
-          def process_census():
+          def container_procs():
               pid = run(["docker", "inspect", "-f", "{{.State.Pid}}", "egym-target"]).stdout.strip()
               # Mount namespace only. Entering the pid namespace would make this
               # shell a container pid greater than 1, and the keeper kills those.
@@ -288,9 +288,33 @@ jobs:
                   parts = line.split(" ", 1)
                   if len(parts) == 2 and parts[0].isdigit():
                       rows.append((int(parts[0]), parts[1].strip()))
+              return rows
+
+
+          def process_census():
+              rows = container_procs()
               d8 = [item for item in rows if item[1] == "d8"]
               keeper = [item for item in rows if item[0] == 1]
               return {"count": len(rows), "d8": len(d8), "pid1": keeper[0][1] if keeper else ""}
+
+
+          def stop_children():
+              # Do not use /tmp/v8/kill. The restored keeper launches on "go"
+              # and then honors "kill" in the same pass, so a leftover kill
+              # file signals the d8 that was just started.
+              for _ in range(50):
+                  victims = [pid for pid, _comm in container_procs() if pid > 1]
+                  if not victims:
+                      time.sleep(0.2)
+                      if not [pid for pid, _comm in container_procs() if pid > 1]:
+                          return
+                      continue
+                  subprocess.run(
+                      ["docker", "exec", "egym-target", "kill", "-9", *[str(pid) for pid in victims]],
+                      capture_output=True,
+                  )
+                  time.sleep(0.15)
+              raise RuntimeError("old d8 did not exit")
 
 
           def restore_node(verify, root, node):
@@ -413,15 +437,7 @@ jobs:
                       program = "try { print('%s'); } catch (e) { print('BRANCH_ERR ' + e); }\nwhile (true) {}\n" % token
                       host = WORKDIR / "branch.js"
                       host.write_text(program)
-                      run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' 1 > /tmp/v8/kill"])
-                      gone = False
-                      for _ in range(50):
-                          if process_census()["d8"] == 0:
-                              gone = True
-                              break
-                          time.sleep(0.2)
-                      if not gone:
-                          raise RuntimeError("old d8 did not exit")
+                      stop_children()
                       run(["docker", "cp", str(host), "egym-target:/tmp/v8/turn.js"])
                       run(["docker", "exec", "egym-target", "sh", "-c", "printf '%s' 1 > /tmp/v8/go"])
                       seen = ""
