@@ -211,6 +211,18 @@ jobs:
               ])
 
 
+          def save_upper(node_dir):
+              upper = run(["docker", "inspect", "-f", "{{.GraphDriver.Data.UpperDir}}", "egym-target"]).stdout.strip()
+              dest = Path(node_dir)
+              dest.mkdir(parents=True, exist_ok=True)
+              tar = dest / "upper.tar.gz"
+              if tar.exists():
+                  tar.unlink()
+              run(["sudo", "tar", "-C", upper, "-czf", str(tar), "."])
+              run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(tar)])
+              return tar
+
+
           def apply_upper(node_dir):
               upper = run(["docker", "inspect", "-f", "{{.GraphDriver.Data.UpperDir}}", "egym-target"]).stdout.strip()
               run(["sudo", "tar", "-C", upper, "-xzf", str(node_dir / "upper.tar.gz")])
@@ -421,9 +433,14 @@ jobs:
                           time.sleep(0.25)
                       if token not in seen:
                           raise RuntimeError("branch output missing: " + seen[:300])
-                      checkpoint_live("b" + node)
+                      if process_census()["d8"] != 1:
+                          raise RuntimeError("d8 was not alive at the branch checkpoint")
+                      live = checkpoint_live("b" + node)
+                      upper_dir = live.parent / ("upper-" + node)
+                      save_upper(upper_dir)
                       run(["docker", "stop", "-t", "5", "egym-target"])
-                      restore_name("b" + node, WORKDIR / "ckpts" / ("b" + node))
+                      apply_upper(upper_dir)
+                      restore_name("b" + node, live)
                       back = read_marker(verify)
                       census = process_census()
                       proc = subprocess.run(["docker", "exec", "egym-target", "cat", "/tmp/v8/out"], capture_output=True)
